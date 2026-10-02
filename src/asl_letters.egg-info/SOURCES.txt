@@ -1,0 +1,7 @@
+README.md
+pyproject.toml
+src/asl_letters/__init__.py
+src/asl_letters.egg-info/PKG-INFO
+src/asl_letters.egg-info/SOURCES.txt
+src/asl_letters.egg-info/dependency_links.txt
+src/asl_letters.egg-info/top_level.txt
