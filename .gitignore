@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Virtual environment
+asl-letters-env/
+venv/
+*.env
+
+# Data — never commit the dataset or generated features
+data/
+data/raw/
+data/processed/
+
+# Model checkpoints
+models/checkpoints/
+
+# OS cruft
+.DS_Store
+Thumbs.db
