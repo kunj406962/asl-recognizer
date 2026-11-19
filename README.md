@@ -1,233 +1,85 @@
-# ASL Letters — Static ASL Alphabet Recognition + Live Webcam Spelling Game
+# ASL Finger-Speller (`asl-letters`)
 
-> Status: **fresh start.** No code, no data, no environment set up yet. This
-> document is the plan we build from. (Suggested repo name: `asl-letters` —
-> rename if you'd rather call it something else, nothing below depends on
-> the name.)
+A real-time webcam game that recognizes static ASL fingerspelling letters. Spell the word on screen, one letter at a time, using your hand.
 
-This is a from-scratch follow-up to an earlier, much heavier project
-(sequence-based ASL *fingerspelling* recognition — LSTM + CTC over
-video-frame landmark sequences). That project is fully deleted (~200GB of
-data) and is **not** being resumed or referenced here except as a lesson
-in scope: this project is deliberately smaller, faster to iterate on, and
-built around a single static image → single letter prediction, not a
-continuous signed sequence.
+**Pipeline:** webcam frame → MediaPipe Hand Landmarker (21 hand keypoints) → normalization → small MLP trained from scratch in PyTorch → letter.
 
----
+> *Add a short demo GIF here (`docs/demo.gif`).*
 
-## 1. What we're building
+## Results
 
-A model that looks at **one photo of a hand making an ASL letter shape**
-and predicts which letter it is — then a live webcam app that does the
-same thing in real time, wrapped in a simple game: the app shows you a
-word to spell, you sign it one letter at a time, and it confirms each
-letter before moving to the next.
+| Test | Result |
+|---|---|
+| Dataset validation (block split, same signer as training) | 93% accuracy, 0.92 macro-F1 over 28 classes |
+| Logistic-regression baseline, same split | 0.90 macro-F1 |
+| **My own webcam, fresh session (different day, place, clothes)** | **92.6%** system accuracy over 336 frames (about 96% excluding `del`) |
 
-**What makes this a *trained-from-scratch* project**, not just gluing
-together existing tools: the actual letter-classification model is one
-we train ourselves, from zero, on labeled data. We do use one pretrained
-third-party component — **MediaPipe Hands** — but only for hand
-*localization/tracking* (it outputs 21 generic hand-joint keypoints; it
-has no concept of ASL or letters at all). That's infrastructure, the same
-role OpenCV or a face detector plays in any CV pipeline — not the thing
-we're here to learn.
+"System accuracy" counts a frame where no hand was detected as a wrong answer, which is what a player experiences. Of the 29 classes, 23 were perfect on the fresh session; the weak ones were `del`, T, M, O and S.
 
-### Why keypoints instead of raw pixels (a CNN on the images directly)
+## How it works
 
-Early look at the dataset (see §3) strongly suggests it's really just a
-handful of distinct hand poses, each captured across thousands of
-near-duplicate video frames (same background, same lighting, same wrist
-angle, sequential filenames). A CNN trained directly on those pixels
-would have an easy time memorizing *this specific background and
-lighting*, and a hard time generalizing to a real webcam — classic
-overfitting-to-nuisance-features trap.
+1. **Keypoints, not pixels.** The dataset is video clips cut into frames, so a CNN on pixels would memorize backgrounds and lighting. MediaPipe's 21 landmarks discard those.
+2. **Normalization.** Landmarks are converted to pixel units, translated so the wrist is the origin, and divided by palm length (wrist to middle knuckle). Hand position and distance from the camera stop mattering. Result: 63 features.
+3. **Classifier.** MLP `63 → 128 → 64 → 28` with ReLU, dropout 0.2, weight decay, and inverse-frequency class weights. Output is 28 classes (A-Z, `del`, `space`). "No hand detected" is treated as NOTHING and never reaches the model.
+4. **Game.** A letter is accepted after 10 consecutive frames with probability ≥ 0.7. Repeated letters (the LL in HELLO) require dropping the hand or changing sign in between.
 
-Routing through MediaPipe's keypoints sidesteps most of that: a keypoint
-is a set of (x, y, z) joint positions *relative to the hand itself* — it
-mostly doesn't care what the background or lighting looks like, since
-MediaPipe itself was trained on a huge, diverse set of real-world hands
-already. We're not fully immune to the dataset's low diversity (still
-worth testing on our own webcam, still worth collecting some of our own
-data — that's V2), but it meaningfully de-risks the generalization
-problem before we've written a line of our own training code.
+## What I learned (decisions backed by measurements)
 
-It's also a much smaller, simpler model: 21 keypoints × (x, y, z) = 63
-numbers in, a small MLP, 29-way softmax out. No convolutions, no
-augmentation pipeline required for V1, trains in minutes.
+- **Random splits lie on video data.** A 1-nearest-neighbour model scored 0.985 on a random split but 0.874 on a block split, because near-twin frames land on both sides. Frames stay similar for hundreds of frames (measured in notebook 01), so validation uses early frames for training, late frames for validation, with a 200-frame buffer.
+- **A strong baseline matters.** Logistic regression reached 0.90 macro-F1; the MLP added about 2 points. Removing dropout and weight decay hurt more (final validation accuracy 0.889 vs 0.925) than changing network size.
+- **MediaPipe misses hands unevenly.** At its default confidence it found hands in only 45% of N frames and 51% of M. Lowering the detection and presence confidence to 0.3 recovered about 5% more frames (no false hands in a 100-frame sample of `nothing`, 14 in all 3,000 on the full run). Padding and 2x upscaling made detection worse.
+- **Flip or not was decided by data.** Flipping webcam frames before detection gave 79.6% vs 8.5% system accuracy raw. The dataset behaves like a mirrored selfie view.
+- **Validation is not deployment.** Evaluation on my own webcam exposed problems validation could not: hand placement (a hand cut off by the frame edge), and a bug in my own data-collection script that mislabeled bursts. Both were found by looking at the failure images.
 
----
+## Known limitations
 
-## 2. Scope
+- **Works mainly with one hand.** The model was trained on one signer's single hand, so keypoints from the other hand are mirror images it has never seen. In my testing it works mainly with my left hand. (A fix is listed below.)
+- **`del` and `space` are unreliable.** They are the dataset author's own signs, not standard ASL, and MediaPipe often cannot detect them. The game uses only A-Z.
+- **T is weak** (often read as L), and **M/N/A** are confusable thumb-tucked fists. N is also detected in only about half of dataset frames.
+- **J and Z** are motion letters; they are recognized as static shapes only.
+- **One tester.** The "own webcam" results are one person, one camera, two sessions.
+- Runs on CPU at interactive speed (about 16 ms per frame for detection).
 
-### V1 — core pipeline (this phase)
-
-1. Download + explore the dataset.
-2. Run MediaPipe Hands over every training image, extract 21 keypoints
-   per image, save as a lightweight feature table (not re-decoding raw
-   images every time we touch this later).
-3. Train a small MLP from scratch: 63 features → predicted letter (29
-   classes: A–Z, SPACE, DEL, NOTHING).
-4. Evaluate — including, critically, **testing against a few of our own
-   webcam photos**, not just the dataset's own held-out split, since
-   that's the real test of whether this generalizes at all.
-5. Build the live webcam demo: MediaPipe Hands on the live feed → same
-   keypoint extraction → trained MLP → predicted letter on screen.
-6. Build the "spell the word" game on top of that: show a target word,
-   highlight the current letter, require N consecutive correctly-predicted
-   frames before advancing (debounce, so one lucky/noisy frame doesn't
-   falsely trigger), celebrate on completion.
-
-### V2 — robustness (after V1 works end-to-end)
-
-- Collect a small set of our own webcam images per letter (even
-  30–50/letter) to mix into training or fine-tune on, closing the
-  generalization gap directly instead of hoping MediaPipe's invariance
-  is enough on its own.
-- Decide how SPACE / DEL / NOTHING should behave in the actual game UI
-  (e.g. SPACE between words, DEL to redo a letter).
-- Confidence thresholding / "no hand detected" handling in the demo.
-- General polish — whatever V1 testing reveals is actually needed, rather
-  than guessing now.
-
-Nothing in V2 is being built yet. V1 is the whole focus until it works.
-
----
-
-## 3. The dataset
-
-**ASL Alphabet** (Kaggle, `grassknoted/asl-alphabet`):
-<https://www.kaggle.com/datasets/grassknoted/asl-alphabet>
-
-- 87,000 training images, 200×200 px, 29 classes: A–Z plus `space`,
-  `del`, `nothing`.
-- Test split is deliberately tiny (~29 images) — the dataset authors'
-  own hint that you're meant to bring your own real-world test images
-  rather than trust their split.
-- **Known caveat (seen directly in a sample of the data before download
-  even completed):** filenames and thumbnails for one letter's folder
-  showed what looks like a single short clip split into thousands of
-  sequential frames (same doorframe in shot, same lighting, same wrist
-  angle, filenames like `B1.jpg, B2.jpg, ..., B1001.jpg...`). Treat the
-  "87,000 images" figure as optimistic for actual pose diversity — this
-  is the whole reason V1 routes through keypoints instead of raw pixels,
-  and why V2 exists at all.
-- Not downloaded yet. Expected to land in `data/raw/` (see §5) — exact
-  subfolder names (`asl_alphabet_train/`, `asl_alphabet_test/`) to be
-  confirmed once downloaded, documented here once known.
-
----
-
-## 4. Environment
-
-- Python virtual env (name TBD when we set it up — suggest
-  `asl-letters-env` unless you'd rather reuse/name it differently).
-- Expected core dependencies (exact versions pinned once installed):
-  - `mediapipe` — hand keypoint detection/tracking
-  - `opencv-python` — webcam capture, image I/O, drawing overlays
-  - `torch` — model definition + training
-  - `numpy`, `pandas` — keypoint feature tables
-  - `scikit-learn` — train/val split, maybe a quick baseline classifier
-    for sanity-checking the MLP against
-- `requirements.txt` generated once the env is actually set up — not
-  guessing exact versions in this doc ahead of time.
-
----
-
-## 5. File structure
-
-Same working process as last time: **notebooks first** for exploration,
-diagnostics, and benchmarking (with markdown cells explaining *why*,
-mistakes kept rather than deleted), then logic that's actually settled
-gets promoted into a real importable `src/` module once it's proven out
-— not written directly into a script from scratch.
+## Setup (Windows)
 
 ```
-asl-letters/
-├── README.md                  # this file
-├── .gitignore
-├── requirements.txt           # pinned once env is set up
-│
-├── data/
-│   ├── raw/                   # downloaded Kaggle dataset, untouched (gitignored)
-│   └── processed/             # extracted keypoints + labels, train/val/test splits (gitignored)
-│
-├── notebooks/
-│   ├── 01_explore_data.ipynb          # look at the raw data, confirm class folders/counts,
-│   │                                   #   sample images, re-confirm the diversity caveat above
-│   ├── 02_extract_keypoints.ipynb     # MediaPipe on one sample image first, then the full set;
-│   │                                   #   benchmark before committing to the full 87k run
-│   ├── 03_train_classifier.ipynb      # MLP training, sanity checks, val accuracy
-│   ├── 04_own_webcam_eval.ipynb       # the real test: does it work on OUR hand/background
-│   └── 05_webcam_demo_prototype.ipynb # live loop prototype before promoting to src/app
-│
-├── src/
-│   └── asl_letters/
-│       ├── __init__.py
-│       ├── keypoints.py       # MediaPipe wrapper: extract_keypoints(image) -> np.ndarray | None
-│       ├── dataset.py         # PyTorch Dataset over the extracted keypoint feature table
-│       ├── model.py           # the MLP classifier definition
-│       ├── train.py           # training loop, promoted from notebook 03 once settled
-│       └── game.py            # "spell the word" state machine (current letter, debounce counter)
-│
-├── models/
-│   └── checkpoints/           # saved .pt files (gitignored)
-│
-└── app/
-    └── webcam_demo.py         # final live entrypoint: python app/webcam_demo.py
+python -m venv asl-letters-venv          # Python 3.10
+asl-letters-venv\Scripts\activate
+pip install mediapipe opencv-python numpy pandas scikit-learn torch matplotlib jupyter ipykernel
+pip install -e .
 ```
 
----
+1. Download the dataset from Kaggle (`grassknoted/asl-alphabet`) into `data/raw/` so you have `data/raw/asl_alphabet_train/<class>/` and `data/raw/asl_alphabet_test/`.
+2. Download `hand_landmarker.task` from Google's MediaPipe Hand Landmarker docs into `models/mediapipe/`.
+3. Run the notebooks in order (below), then `python app/webcam_demo.py`.
 
-## 6. `.gitignore` (starting point)
+Data and model files are not committed.
 
-```gitignore
-# Python
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
+## Project structure
 
-# Virtual environment
-asl-letters-env/
-venv/
-*.env
-
-# Data — never commit the dataset or generated features
-data/raw/
-data/processed/
-
-# Model checkpoints
-models/checkpoints/
-
-# OS cruft
-.DS_Store
-Thumbs.db
+```
+notebooks/
+  01_explore_data.ipynb        dataset checks, near-duplicate frame analysis
+  02_extract_keypoints.ipynb   MediaPipe, detection-rate experiments, normalization, full extraction
+  03_train_classifier.ipynb    block split, baselines, MLP, design experiments, confusions
+  04_own_webcam_eval.ipynb     flip decision, accuracy on my own hand, thresholds
+src/asl_letters/
+  keypoints.py                 detector options, detect, normalize (shared by notebooks and app)
+  model.py                     MLP definition and checkpoint loading
+app/
+  collect_webcam.py            record labelled frames from the webcam
+  webcam_demo.py               the spelling game
+data/{raw,processed,own_webcam}/   (gitignored)
+models/                        (gitignored)
 ```
 
-(Adjust the venv folder name here once it's actually created, if it ends
-up named differently.)
+## Future work
 
----
+- **Mirror augmentation** (negate the x coordinates of training features) so the model works with either hand.
+- Train on my own webcam frames in addition to the dataset, to fix T and M.
+- Sequence model for the motion letters J and Z.
+- Handle SPACE/DEL with a deliberate gesture or the keyboard.
 
-## 7. Open questions / decisions still pending
+## Credits
 
-- [ ] Confirm repo/folder name (`asl-letters` is just a placeholder).
-- [ ] Confirm venv name.
-- [ ] Download the dataset, confirm actual subfolder structure inside
-      `data/raw/`, update §3 with the real paths.
-- [ ] Decide exactly how many consecutive frames the game's debounce
-      should require before confirming a letter (start with a guess,
-      tune once we feel how it plays).
-
----
-
-## 8. Explicitly not doing right now
-
-- No sequence modeling / continuous fingerspelling recognition — that
-  was the old project. This one is single static letter in, single
-  letter out, every time.
-- No training our own hand-detector/localizer from scratch — MediaPipe
-  handles that; our training effort goes entirely into the
-  keypoints → letter classifier.
-- No data augmentation pipeline in V1 — if V1's own-webcam testing (step
-  4 above) shows it's needed, that becomes part of V2, not bolted on
-  speculatively now.
+Dataset: Kaggle `grassknoted/asl-alphabet`. Hand landmarks: Google MediaPipe Hand Landmarker. Built as a learning project, with Claude as a tutor and pair-programmer; I ran, debugged and validated every step, and the notebooks keep my mistakes on purpose.
